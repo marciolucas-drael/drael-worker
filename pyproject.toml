@@ -1,0 +1,14 @@
+[project]
+name = "drael-worker"
+version = "0.2.0"
+description = "Drael mission worker - execution of remote missions"
+requires-python = ">=3.9,<4.0"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.5",
+]
+
+[build-system]
+requires = ["poetry-core>=1.8"]
+build-backend = "poetry.core.masonry.api"
