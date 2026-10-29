@@ -37,6 +37,41 @@ LOCK = threading.Lock()
 EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
+def _persist():
+    """Grava estado dos jobs em disco (sobrevive a restart do container)."""
+    try:
+        state = os.path.join(WORKDIR, "jobs_state.json")
+        tmp = state + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(list(JOBS.values()), f, default=str)
+        os.replace(tmp, state)
+    except Exception as e:
+        print(f"[persist falhou] {e}", flush=True)
+
+
+def _restore():
+    """Carrega jobs persistidos ao subir (pending/running viram interrupted)."""
+    state = os.path.join(WORKDIR, "jobs_state.json")
+    if not os.path.exists(state):
+        return
+    try:
+        with open(state) as f:
+            items = json.load(f)
+    except Exception:
+        return
+    with LOCK:
+        for v in items[-60:]:
+            v = dict(v)
+            if v.get("status") in ("pending", "running"):
+                v["status"] = "interrupted"
+                v.setdefault("error", "instância reiniciou durante a execução")
+            JOBS[v["id"]] = v
+    print(f"[restore] {len(items)} jobs carregados do disco", flush=True)
+
+
+_restore()
+
+
 def ntfy(title, msg, prio="high"):
     try:
         req = urllib.request.Request(
@@ -122,6 +157,7 @@ def run_job(job_id):
     with LOCK:
         j.update(status=status, rc=rc, finished_at=now, seconds=round(now - t0, 1),
                  output=(out or "")[-4000:], error=(err or "")[-2000:] or None, artifacts=artifacts)
+        _persist()
     ntfy(f"[{status}] {j['title']}",
          f"{j['title']}\nrc={rc} em {round(now - t0, 1)}s id={job_id}\n"
          + "".join(f"- {a['name']}: {a['url']}\n" for a in artifacts if a.get("url"))
@@ -187,11 +223,14 @@ def _create_job(body: JobIn):
     job_id = uuid.uuid4().hex[:10]
     j = {"id": job_id, "title": body.title[:120], "cmd": body.cmd,
          "timeout": body.timeout, "status": "pending", "artifacts": []}
+    rdir = os.path.join(RESULTS, job_id)
+    os.makedirs(os.path.join(rdir, "artifacts"), exist_ok=True)
     with LOCK:
         JOBS[job_id] = j
-        for k in list(JOBS)[:60]:
+        finished = [k for k, v in JOBS.items() if v.get("status") in ("done", "failed")]
+        for k in finished[50:]:
             JOBS.pop(k, None)
-    os.makedirs(os.path.join(RESULTS, job_id, "artifacts"), exist_ok=True)
+        _persist()
     EXECUTOR.submit(run_job, job_id)
     ntfy(f"[novo] {j['title']}", f"missão enfileirada id={job_id}", prio="default")
     return {"ok": True, "id": job_id}
