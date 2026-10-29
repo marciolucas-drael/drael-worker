@@ -29,7 +29,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.responses import PlainTextResponse
 
-VERSION = "1.1"
+VERSION = "1.2"
 app = FastAPI(title="Drael Worker", version=VERSION)
 
 WORKDIR = "/home/render/workdir" if os.path.isdir("/home/render/workdir") else os.path.expanduser("~")
@@ -260,6 +260,16 @@ def run_job(job_id):
     finally:
         with LOCK:
             ACTIVE.discard(job_id)
+            _j = JOBS.get(job_id)
+            need = bool(_j and _j.get("status") == "pending")
+        if need:
+            print(f"[lost-wakeup] {job_id} pendente sem executor vivo — re-enfileirando", flush=True)
+            try:
+                ntfy(f"[requeue] {_j['title']}",
+                     f"job {job_id} re-enfileirado (lost-wakeup corrigido)", prio="default")
+            except Exception:
+                pass
+            EXECUTOR.submit(run_job, job_id)
 
 
 def authed(req):
