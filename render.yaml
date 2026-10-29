@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: drael-worker
+    runtime: python
+    plan: free
+    healthCheckPath: /healthz
+    autoDeploy: true
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: NTFY_TOPIC
+        value: SET_IN_RENDER_ENV
+      - key: AUTH_TOKEN
+        value: SET_IN_RENDER_ENV
