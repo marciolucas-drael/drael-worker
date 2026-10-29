@@ -113,7 +113,11 @@ def upload_uguu(path):
                               "User-Agent": "Mozilla/5.0 (compatible; DraelWorker/1.0)"})
         r = conn.getresponse()
         if r.status == 200:
-            return json.loads(r.read())["url"]
+            d = json.loads(r.read())
+            files = d.get("files") or []
+            if files and files[0].get("url"):
+                return files[0]["url"]
+            return d.get("url")
     except Exception as e:
         print(f"[uguu falhou {fn}] {e}", flush=True)
     return None
