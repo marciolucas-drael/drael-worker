@@ -29,7 +29,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.responses import PlainTextResponse
 
-VERSION = "1.2"
+VERSION = "1.3"
 app = FastAPI(title="Drael Worker", version=VERSION)
 
 WORKDIR = "/home/render/workdir" if os.path.isdir("/home/render/workdir") else os.path.expanduser("~")
@@ -423,3 +423,260 @@ def get_job(job_id):
     if d["status"] in ("done", "failed"):
         d["output"] = j.get("output")
     return {"ok": True, "job": d}
+
+
+# ============================================================
+# FASE 1 — Integração ChatGPT: endpoint MCP SOMENTE LEITURA (v1.3)
+# - POST /mcp e POST /mcp/{token}: MCP Streamable HTTP (JSON-RPC 2.0)
+#   Metodos: initialize, notifications/*, tools/list, tools/call
+# - Auth: token == env MCP_TOKEN via URL (/mcp/<token>), header
+#   Authorization: Bearer <token>, x-mcp-token ou query ?token=<token>
+#   (independente do AUTH_TOKEN dos jobs -> revogacao isolada)
+# - POST /snapshot: recebe copia de leitura autorizada enviada pelo Minis
+#   (auth via AUTH_TOKEN), grava em WORKDIR/snapshot.json
+# - Auditoria: toda chamada em WORKDIR/mcp_audit.jsonl
+# ============================================================
+from fastapi.responses import JSONResponse as _MCP_JSONResp, Response as _MCP_Resp
+
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
+MCP_SNAP_FILE = os.path.join(WORKDIR, "snapshot.json")
+MCP_AUDIT_FILE = os.path.join(WORKDIR, "mcp_audit.jsonl")
+_MCP_LOCK = threading.Lock()
+
+
+def _mcp_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _mcp_load_snapshot():
+    try:
+        with open(MCP_SNAP_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_MCP_STATE = {"data": _mcp_load_snapshot(), "updated_at": None}
+try:
+    with _MCP_LOCK:
+        _st = os.stat(MCP_SNAP_FILE)
+        _MCP_STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_st.st_mtime))
+except Exception:
+    pass
+
+
+def _mcp_audit(tool, args, ok=True, detail=""):
+    try:
+        rec = {"ts": _mcp_now(), "tool": tool, "args": args or {}, "ok": ok, "detail": str(detail)[:200]}
+        with open(MCP_AUDIT_FILE, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _mcp_authed(req, path_token=""):
+    if not MCP_TOKEN:
+        return False
+    bearer = req.headers.get("authorization", "")
+    if bearer.lower().startswith("bearer "):
+        bearer = bearer[7:].strip()
+    cand = {bearer, req.headers.get("x-mcp-token", "").strip(),
+            req.query_params.get("token", "").strip(), (path_token or "").strip()}
+    return MCP_TOKEN in cand
+
+
+_MCP_TOOLS = [
+    {"name": "drael_status",
+     "description": "Status geral do ambiente Drael (servicos, saude, horario da ultima sincronizacao). Use this when asked how the Drael system is doing or its overall state.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "list_docs",
+     "description": "Lista dos documentos tecnicos disponiveis (relatorios, diagnosticos, missoes). Use this when asked what documents/reports exist.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "get_doc",
+     "description": "Retorna o conteudo de um documento tecnico especifico por id. Use this after list_docs to read a specific report.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "section": {"type": "string"}}, "required": ["id"]},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "recent_tests",
+     "description": "Resultados e evidencias de testes recentes (governanca, QC, integridade). Use this when asked whether tests were executed correctly.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "memory_status",
+     "description": "Estado do modulo de memoria (contagens por tipo/projeto, quarentena de itens sensiveis). So contagens — nunca conteudo intimo. Use this when asked about the memory system or its professional/sensitive separation.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "recent_logs",
+     "description": "Registros recentes de execucao/erros/diagnosticos (trilha de auditoria de missoes). Use this when asked about recent execution records or errors.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "audit_log",
+     "description": "Registro das consultas feitas a esta ponte (quem consultou o que e quando). Use this to audit previous queries made to the Drael bridge.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+]
+
+
+def _mcp_run_tool(name, args):
+    s = (_MCP_STATE.get("data") or {})
+    up = _MCP_STATE.get("updated_at")
+
+    def wrap(obj):
+        return {"content": [{"type": "text", "text": json.dumps(obj, ensure_ascii=False, indent=2)}], "isError": False}
+
+    if name == "drael_status":
+        return wrap({"ok": True, "worker_version": VERSION, "worker": "online",
+                     "snapshot_updated_at_utc": up,
+                     "status": s.get("status", {}),
+                     "note": "Leitura somente. Os dados refletem a ultima sincronizacao autorizada (snapshot_updated_at_utc)."})
+    if name == "list_docs":
+        docs = s.get("docs", [])
+        return wrap({"ok": True, "count": len(docs),
+                     "docs": [{"id": d.get("id"), "title": d.get("title"), "updated_at": d.get("updated_at"), "chars": len(d.get("content", ""))} for d in docs]})
+    if name == "get_doc":
+        did = (args or {}).get("id", "")
+        section = ((args or {}).get("section") or "").strip()
+        for d in s.get("docs", []):
+            if d.get("id") == did:
+                c = d.get("content", "")
+                out = {"ok": True, "id": did, "title": d.get("title"), "updated_at": d.get("updated_at")}
+                if section:
+                    low, sl = c.lower(), section.lower()
+                    i = low.find(sl)
+                    if i < 0:
+                        return {"content": [{"type": "text", "text": "secao nao encontrada no documento %s" % did}], "isError": True}
+                    start = c.rfind("\n## ", 0, i)
+                    start = start + 1 if start >= 0 else max(0, i - 150)
+                    nxt = low.find("\n## ", i + len(sl))
+                    end = nxt if nxt >= 0 else min(len(c), start + 6000)
+                    out.update({"content": c[start:end], "section": section, "truncated": nxt < 0})
+                else:
+                    out.update({"content": c[:12000], "truncated": len(c) > 12000})
+                return wrap(out)
+        return {"content": [{"type": "text", "text": "documento nao encontrado: %s (veja list_docs)" % did}], "isError": True}
+    if name == "recent_tests":
+        return wrap({"ok": True, "tests": (s.get("tests") or [])[-40:]})
+    if name == "memory_status":
+        return wrap({"ok": True, "memory": s.get("memory", {}),
+                     "note": "So contagens e estrutura. Itens em quarentena (sensiveis) NAO tem conteudo exposto."})
+    if name == "recent_logs":
+        return wrap({"ok": True, "logs": (s.get("logs") or [])[-60:]})
+    if name == "audit_log":
+        lines = []
+        try:
+            with open(MCP_AUDIT_FILE) as f:
+                lines = f.readlines()
+        except Exception:
+            pass
+        entries = []
+        for x in lines[-60:]:
+            try:
+                entries.append(json.loads(x))
+            except Exception:
+                pass
+        return wrap({"ok": True, "total": len(lines), "recent": entries})
+    return {"content": [{"type": "text", "text": "ferramenta desconhecida: %s" % name}], "isError": True}
+
+
+def _mcp_headers():
+    return {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Authorization, X-MCP-Token, Content-Type",
+            "Access-Control-Allow-Methods": "POST, OPTIONS"}
+
+
+def _mcp_handle_rpc(payload, req, path_token):
+    if not isinstance(payload, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    method = payload.get("method")
+    params = payload.get("params") or {}
+    rid = payload.get("id")
+
+    def jrpc(result=None, error=None):
+        o = {"jsonrpc": "2.0", "id": rid}
+        if error:
+            o["error"] = error
+        else:
+            o["result"] = result
+        return o
+
+    if method == "initialize":
+        ver = params.get("protocolVersion") or "2025-06-18"
+        _mcp_audit("initialize", {"client": (params.get("clientInfo") or {})}, True)
+        return jrpc({"protocolVersion": ver, "capabilities": {"tools": {}},
+                     "serverInfo": {"name": "drael-worker-mcp", "version": VERSION},
+                     "instructions": ("Ponte somente-leitura com o ambiente Drael (OpenMinis/iSH). "
+                                      "Responda sempre mencionando snapshot_updated_at_utc como frescor dos dados.")})
+    if method in ("notifications/initialized", "initialized") or (isinstance(method, str) and method.startswith("notifications/")):
+        return None
+    if method == "tools/list":
+        _mcp_audit("tools/list", {}, True)
+        return jrpc({"tools": _MCP_TOOLS})
+    if method == "tools/call":
+        tn = params.get("name") or ""
+        ta = params.get("arguments") or {}
+        try:
+            res = _mcp_run_tool(tn, ta)
+            _mcp_audit("tools/call:" + tn, ta, not res.get("isError", False))
+        except Exception as e:
+            res = {"content": [{"type": "text", "text": "erro interno: %s" % e}], "isError": True}
+            _mcp_audit("tools/call:" + tn, ta, False, repr(e)[:200])
+        return jrpc(res)
+    if rid is None:
+        return None
+    return jrpc(error={"code": -32601, "message": "metodo nao suportado: %s" % method})
+
+
+@app.options("/mcp")
+@app.options("/mcp/{path_token}")
+def mcp_options():
+    return _MCP_Resp(status_code=204, headers=_mcp_headers())
+
+
+@app.post("/mcp")
+@app.post("/mcp/{path_token}")
+async def mcp_endpoint(req: Request, path_token: str = ""):
+    if not _mcp_authed(req, path_token):
+        _mcp_audit("_auth_fail", {"path": "/mcp/" + (path_token or "")[:12]}, False, "token invalido")
+        return _MCP_JSONResp({"error": "unauthorized"}, status_code=401,
+                             headers={**_mcp_headers(), "WWW-Authenticate": "Bearer"})
+    try:
+        raw = await req.body()
+        payload = json.loads(raw.decode("utf-8") or "null")
+    except Exception:
+        return _MCP_JSONResp({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
+                             headers=_mcp_headers())
+    if isinstance(payload, list):
+        out = []
+        for item in payload:
+            r = _mcp_handle_rpc(item, req, path_token)
+            if r is not None:
+                out.append(r)
+        return _MCP_JSONResp(out, headers=_mcp_headers())
+    r = _mcp_handle_rpc(payload, req, path_token)
+    if r is None:
+        return _MCP_Resp(status_code=202, headers=_mcp_headers())
+    return _MCP_JSONResp(r, headers=_mcp_headers())
+
+
+@app.post("/snapshot")
+async def push_snapshot(req: Request):
+    if AUTH and not authed(req):
+        return _MCP_JSONResp({"error": "unauthorized"}, status_code=401)
+    try:
+        body = json.loads((await req.body()).decode("utf-8") or "{}")
+    except Exception:
+        return _MCP_JSONResp({"error": "bad json"}, status_code=400)
+    snap = body.get("data", body)
+    nbytes = len(json.dumps(snap, ensure_ascii=False))
+    if nbytes > 700000:
+        return _MCP_JSONResp({"error": "snapshot muito grande (%d bytes)" % nbytes}, status_code=413)
+    with _MCP_LOCK:
+        tmp = MCP_SNAP_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        os.replace(tmp, MCP_SNAP_FILE)
+        _MCP_STATE["data"] = snap
+        _MCP_STATE["updated_at"] = _mcp_now()
+        _st = _MCP_STATE["updated_at"]
+    _mcp_audit("_snapshot", {"bytes": nbytes, "docs": len(snap.get("docs", []))}, True)
+    return {"ok": True, "updated_at": _st, "bytes": nbytes}

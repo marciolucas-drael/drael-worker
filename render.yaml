@@ -14,3 +14,5 @@ services:
         value: SET_IN_RENDER_ENV
       - key: AUTH_TOKEN
         value: SET_IN_RENDER_ENV
+      - key: MCP_TOKEN
+        value: SET_IN_RENDER_ENV
